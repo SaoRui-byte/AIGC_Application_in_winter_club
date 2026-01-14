@@ -21,13 +21,15 @@ BAIDU_API_KEY = os.getenv("BAIDU_API_KEY")
 BAIDU_SECRET_KEY = os.getenv("BAIDU_SECRET_KEY")
 baidu_client = AipSpeech(BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY) if BAIDU_APP_ID and BAIDU_API_KEY and BAIDU_SECRET_KEY else None
 
-# 初始化会话状态
+# 初始化会话状态（新增图片上传的状态跟踪）
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # 对话历史
 if "uploaded_image_base64" not in st.session_state:
     st.session_state.uploaded_image_base64 = None  # 上传的图片
 if "tts_audio_segments" not in st.session_state:
     st.session_state.tts_audio_segments = []  # 存储分段音频字节流
+if "last_image_uploaded" not in st.session_state:
+    st.session_state.last_image_uploaded = None  # 跟踪最后一次上传的图片标识
 
 # ------------------------------
 # 核心1：sounddevice本地录音
@@ -147,7 +149,6 @@ def baidu_text_to_speech(text, per=0):
 # ------------------------------
 # 核心4：前端合并音频（Web Audio API）
 # ------------------------------
-# （其他代码不变，仅替换 merge_audio_frontend 函数）
 def merge_audio_frontend(audio_segments):
     """
     将分段音频字节流转为base64，传给前端用Web Audio API合并（带暂停/防重叠功能）
@@ -265,7 +266,7 @@ def pet_text_chat(user_input, chat_history):
         return "抱歉，暂时无法处理请求，请稍后再试。"
 
 # ------------------------------
-# 界面布局（新增合并播放按钮）
+# 界面布局（修复图片上传bug）
 # ------------------------------
 st.title("🐾 宠物识别与养护助手 | 语音交互版")
 st.caption("（大二作业 · 百度语音识别+合成 + 智谱AI | 无ffmpeg依赖）")
@@ -278,19 +279,42 @@ with st.sidebar:
     else:
         st.error("❌ 未配置百度语音参数")
     
-    # 图片上传
+    # 图片上传（核心修复：添加key + 强制更新状态）
     st.subheader("📷 上传宠物照片")
-    uploaded_image = st.file_uploader("选择照片（jpg/png）", type=["jpg", "png", "jpeg"])
+    uploaded_image = st.file_uploader(
+        "选择照片（jpg/png）", 
+        type=["jpg", "png", "jpeg"],
+        key="pet_image_uploader",  # 关键：添加唯一key，确保组件状态跟踪
+        help="上传新图片会自动替换旧图片，无需清空对话"
+    )
+    
+    # 修复：检测新图片上传并强制更新session_state
     if uploaded_image:
-        image_base64 = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
-        st.session_state.uploaded_image_base64 = f"data:image/jpeg;base64,{image_base64}"
-        st.image(uploaded_image, caption="已上传的宠物照片", use_column_width=True)
+        # 生成唯一标识（文件名+大小），判断是否是新图片
+        image_identifier = f"{uploaded_image.name}_{uploaded_image.size}"
+        if image_identifier != st.session_state.last_image_uploaded:
+            image_base64 = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
+            st.session_state.uploaded_image_base64 = f"data:image/jpeg;base64,{image_base64}"
+            st.session_state.last_image_uploaded = image_identifier  # 更新最后上传的标识
+            st.success("✅ 新图片已上传并生效！")
+        st.image(uploaded_image, caption="当前上传的宠物照片", use_column_width=True)
+    else:
+        # 无图片时重置状态
+        st.session_state.uploaded_image_base64 = None
+        st.session_state.last_image_uploaded = None
+        st.info("请上传宠物照片以启用图片识别功能")
+    
+    # 新增：清空图片按钮（可选）
+    if st.button("🗑️ 清空当前图片", key="clear_image"):
+        st.session_state.uploaded_image_base64 = None
+        st.session_state.last_image_uploaded = None
+        st.rerun()  # 刷新界面
     
     st.divider()
     
     # 本地录音模块
     st.subheader("🎤 本地语音提问")
-    record_duration = st.number_input("录音时长（秒）", min_value=1, max_value=10, value=5, step=1)
+    record_duration = st.number_input("录音时长（秒）", min_value=1, max_value=10, value=5, step=1, key="record_duration")
     
     # 语音播报发音人选择
     st.subheader("🔊 语音播报设置")
@@ -298,13 +322,14 @@ with st.sidebar:
         "选择发音人",
         options=["女声（默认）", "男声", "情感女声", "情感男声"],
         index=0,
+        key="voice_type",
         help="不同发音人效果不同，可按需选择"
     )
     per_map = {"女声（默认）":0, "男声":1, "情感女声":3, "情感男声":4}
     selected_per = per_map[voice_type]
     
     # 开始录音按钮
-    if st.button("▶️ 开始录音并识别", type="primary"):
+    if st.button("▶️ 开始录音并识别", type="primary", key="record_btn"):
         # 录音 → 识别 → 对话 → 合成语音
         wav_bytes = record_audio_with_sounddevice(duration=record_duration)
         if not wav_bytes:
@@ -317,12 +342,12 @@ with st.sidebar:
         st.success(f"✅ 语音识别结果：{recognized_text}")
         user_prompt = recognized_text
         
-        # 展示用户输入
+        # 展示用户输入（修复：去掉key参数）
         with st.chat_message("user"):
             st.markdown(user_prompt)
         st.session_state.chat_history.append({"role": "user", "content": user_prompt})
         
-        # 调用智谱AI生成回复
+        # 调用智谱AI生成回复（使用最新的图片）
         with st.chat_message("assistant"):
             with st.spinner("🤔 正在生成回复..."):
                 if st.session_state.uploaded_image_base64:
@@ -349,22 +374,24 @@ with st.sidebar:
     st.divider()
     
     # 功能按钮
-    if st.button("⏹️ 结束项目", type="primary"):
+    if st.button("⏹️ 结束项目", type="primary", key="stop_btn"):
         st.warning("⚠️ 项目已停止运行！")
         st.info("✅ 请在终端按 Ctrl + C 彻底关闭服务")
         st.stop()
     
-    if st.button("🗑️ 清空对话历史"):
+    if st.button("🗑️ 清空对话历史", key="clear_chat"):
         st.session_state.chat_history = []
-        st.session_state.uploaded_image_base64 = None
         st.session_state.tts_audio_segments = []
+        # 保留图片状态（可选：如需清空图片，取消下面注释）
+        # st.session_state.uploaded_image_base64 = None
+        # st.session_state.last_image_uploaded = None
         st.rerun()
 
 # ------------------------------
-# 聊天界面（新增合并播放按钮）
+# 聊天界面（修复：去掉所有st.chat_message的key参数）
 # ------------------------------
 # 渲染历史对话
-for msg in st.session_state.chat_history:
+for idx, msg in enumerate(st.session_state.chat_history):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         # 助手回复展示语音播放按钮
@@ -374,12 +401,12 @@ for msg in st.session_state.chat_history:
             if merge_js:
                 st.components.v1.html(merge_js, height=50)
             # 保留分段播放按钮
-            for idx, audio_bytes in enumerate(st.session_state.tts_audio_segments):
-                st.caption(f"🎧 语音播报 - 第{idx+1}段")
+            for seg_idx, audio_bytes in enumerate(st.session_state.tts_audio_segments):
+                st.caption(f"🎧 语音播报 - 第{seg_idx+1}段")
                 st.audio(audio_bytes, format='audio/mp3')
 
-# 文字输入框
-user_prompt = st.chat_input("输入你的问题（如：它一直挠耳朵怎么办？）")
+# 文字输入框（添加key）
+user_prompt = st.chat_input("输入你的问题（如：它一直挠耳朵怎么办？）", key="chat_input")
 if user_prompt:
     with st.chat_message("user"):
         st.markdown(user_prompt)

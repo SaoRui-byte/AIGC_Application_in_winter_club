@@ -1,0 +1,2 @@
+# AIGC_Application_in_winter_club
+大二冬令营关于AI的小项目

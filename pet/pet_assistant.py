@@ -7,32 +7,54 @@ from dotenv import load_dotenv
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
-from aip import AipSpeech  # 百度语音识别/合成SDK
+from aip import AipSpeech
 import io
-import re  # 文本清洗用
+import re
 
 # 加载环境变量
 load_dotenv()
 client = ZhipuAI(api_key=os.getenv("ZHIPU_API_KEY"))
 
-# 百度语音配置（识别+合成共用）
+# 百度语音配置
 BAIDU_APP_ID = os.getenv("BAIDU_APP_ID")
 BAIDU_API_KEY = os.getenv("BAIDU_API_KEY")
 BAIDU_SECRET_KEY = os.getenv("BAIDU_SECRET_KEY")
-baidu_client = AipSpeech(BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY) if BAIDU_APP_ID and BAIDU_API_KEY and BAIDU_SECRET_KEY else None
+baidu_client = AipSpeech(BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY) if all([BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY]) else None
 
-# 初始化会话状态（新增图片上传的状态跟踪）
+# 初始化会话状态（新增新图片上传标志）
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # 对话历史
+    st.session_state.chat_history = []  
 if "uploaded_image_base64" not in st.session_state:
-    st.session_state.uploaded_image_base64 = None  # 上传的图片
+    st.session_state.uploaded_image_base64 = None
 if "tts_audio_segments" not in st.session_state:
-    st.session_state.tts_audio_segments = []  # 存储分段音频字节流
+    st.session_state.tts_audio_segments = []
 if "last_image_uploaded" not in st.session_state:
-    st.session_state.last_image_uploaded = None  # 跟踪最后一次上传的图片标识
+    st.session_state.last_image_uploaded = None
+# 新增：跟踪是否刚上传了新图片
+if "is_new_image_uploaded" not in st.session_state:
+    st.session_state.is_new_image_uploaded = False
 
 # ------------------------------
-# 核心1：sounddevice本地录音
+# 辅助函数：意图检测
+# ------------------------------
+def detect_intent(user_input):
+    """检测用户输入的意图，判断是回溯历史还是当前图片提问"""
+    # 回溯历史的关键词
+    history_keywords = ["之前", "刚才", "之前问的", "那只", "之前的", "之前说的", "之前的问题"]
+    # 当前图片的关键词
+    current_image_keywords = ["这只", "这是什么", "它", "这张", "当前", "现在"]
+    
+    # 检查是否包含回溯历史的关键词
+    if any(keyword in user_input for keyword in history_keywords):
+        return "history"
+    # 检查是否包含当前图片的关键词
+    elif any(keyword in user_input for keyword in current_image_keywords):
+        return "current_image"
+    else:
+        return "default"
+
+# ------------------------------
+# 1. 本地录音功能
 # ------------------------------
 def record_audio_with_sounddevice(duration=5, samplerate=16000):
     try:
@@ -59,7 +81,7 @@ def record_audio_with_sounddevice(duration=5, samplerate=16000):
         return None
 
 # ------------------------------
-# 核心2：百度语音识别（ASR）
+# 2. 百度语音识别（ASR）
 # ------------------------------
 def baidu_speech_to_text(wav_bytes):
     if not baidu_client:
@@ -82,87 +104,63 @@ def baidu_speech_to_text(wav_bytes):
         return ""
 
 # ------------------------------
-# 核心3：百度语音合成（TTS）- 修复所有报错
+# 3. 百度语音合成（TTS）
 # ------------------------------
 def baidu_text_to_speech(text, per=0):
-    """
-    百度文字转语音（TTS）- 无ffmpeg/pydub + 修复param err + 兼容旧版Streamlit
-    """
     if not baidu_client:
         st.error("❌ 未配置百度语音参数，无法播报语音")
         return None
     
-    # 1. 文本清洗（去除特殊字符/换行/多余空格）
-    text = re.sub(r'\n+', ' ', text)  # 换行替换为空格
-    text = re.sub(r'\s+', ' ', text)  # 多个空格合并为一个
-    text = text.strip()               # 去除首尾空格
+    # 文本清洗
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
     
-    # 2. 空文本校验
-    MAX_SEGMENT_LEN = 500
-    if not text or len(text) == 0:
+    if not text:
         st.warning("⚠️ 无有效文本可合成语音")
         return None
     
+    MAX_SEGMENT_LEN = 500
+    text_segments = [text[i:i+MAX_SEGMENT_LEN].strip() for i in range(0, len(text), MAX_SEGMENT_LEN) if text[i:i+MAX_SEGMENT_LEN].strip()]
+    
     try:
-        # 3. 文本分段（500字/段）
-        text_segments = []
-        if len(text) <= MAX_SEGMENT_LEN:
-            text_segments = [text]
-        else:
-            st.warning(f"⚠️ 文本过长（{len(text)}字），将分为{len(text)//MAX_SEGMENT_LEN + 1}段播放")
-            for i in range(0, len(text), MAX_SEGMENT_LEN):
-                segment = text[i:i+MAX_SEGMENT_LEN].strip()
-                if segment:  # 跳过空分段
-                    text_segments.append(segment)
-        
-        # 4. 逐段合成语音（修正百度API参数顺序）
         audio_segments = []
         for idx, segment in enumerate(text_segments):
-            # 百度TTS正确参数格式
             result = baidu_client.synthesis(
-                segment,          # 参数1：要合成的文本
-                'zh',             # 参数2：语言（中文）
-                1,                # 参数3：客户端类型（固定1）
+                segment,
+                'zh',
+                1,
                 {
-                    'vol': 5,     # 音量（0-15）
-                    'per': per,   # 发音人（0=女声，1=男声，3=情感女声，4=情感男声）
-                    'spd': 5,     # 语速（0-9）
-                    'pit': 5,     # 音调（0-9）
-                    'aue': 3      # 音频格式（3=mp3，兼容前端播放）
+                    'vol': 5,
+                    'per': per,
+                    'spd': 5,
+                    'pit': 5,
+                    'aue': 3
                 }
             )
             
-            # 5. 处理合成结果
             if isinstance(result, dict):
                 st.error(f"❌ 第{idx+1}段合成失败：{result.get('err_msg', '未知错误')}")
                 return None
             audio_segments.append(result)
-            st.info(f"✅ 第{idx+1}段语音合成完成")
         
-        st.success("✅ 所有语音段合成完成！可依次播放或合并播放")
+        st.success(f"✅ 语音合成完成（共{len(audio_segments)}段）")
         return audio_segments
-    
     except Exception as e:
         st.error(f"❌ 语音合成出错：{str(e)}")
         return None
 
 # ------------------------------
-# 核心4：前端合并音频（Web Audio API）
+# 4. 前端音频合并播放
 # ------------------------------
 def merge_audio_frontend(audio_segments):
-    """
-    将分段音频字节流转为base64，传给前端用Web Audio API合并（带暂停/防重叠功能）
-    """
-    if not audio_segments or len(audio_segments) == 0:
+    if not audio_segments:
         return None
     
-    # 将每个音频字节流转为base64
     segment_base64_list = [base64.b64encode(seg).decode('utf-8') for seg in audio_segments]
     
-    # 生成前端合并音频的JavaScript代码（修复重叠+暂停功能）
     js_code = f"""
     <script>
-    // 全局变量管理播放状态
     let audioContext = null;
     let source = null;
     let mergedBuffer = null;
@@ -173,7 +171,6 @@ def merge_audio_frontend(audio_segments):
     async function togglePlayback() {{
         if (!audioContext) {{
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            // 首次加载时合并音频
             const buffers = [];
             for (const base64 of {segment_base64_list}) {{
                 const response = await fetch(`data:audio/mp3;base64,${{base64}}`);
@@ -181,7 +178,6 @@ def merge_audio_frontend(audio_segments):
                 const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
                 buffers.push(audioBuffer);
             }}
-            // 合并所有音频片段
             const totalLength = buffers.reduce((sum, buf) => sum + buf.length, 0);
             mergedBuffer = audioContext.createBuffer(1, totalLength, buffers[0].sampleRate);
             let offset = 0;
@@ -192,13 +188,11 @@ def merge_audio_frontend(audio_segments):
         }}
 
         if (isPlaying) {{
-            // 暂停播放
             source.stop();
             pauseTime = audioContext.currentTime - startTime;
             isPlaying = false;
             document.getElementById('mergePlayBtn').innerText = '▶️ 继续播放完整语音';
         }} else {{
-            // 开始/继续播放
             if (source && source.state === 'running') {{
                 source.stop();
             }}
@@ -210,7 +204,6 @@ def merge_audio_frontend(audio_segments):
             isPlaying = true;
             document.getElementById('mergePlayBtn').innerText = '⏸️ 暂停播放';
 
-            // 播放结束后重置状态
             source.onended = () => {{
                 isPlaying = false;
                 pauseTime = 0;
@@ -226,52 +219,66 @@ def merge_audio_frontend(audio_segments):
     return js_code
 
 # ------------------------------
-# 核心5：智谱AI对话/多模态识别
+# 5. 智谱AI对话
 # ------------------------------
-def pet_multimodal_chat(image_base64, user_input, chat_history):
-    context = "\n".join([f"{item['role']}: {item['content']}" for item in chat_history])
+def pet_multimodal_chat(image_base64, user_input, chat_history, use_history=True):
     messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"""
-                    你是专业的宠物专家，精通动物品种和动物医疗方面知识，请回答简洁精准：
-                    历史对话：{context}
-                    用户问题：{user_input}
-                    请先识别品种，再根据用户问题进行回答，如果用户判断错误，你应当指出错误，并进行解释
-                """},
-                {"type": "image_url", "image_url": {"url": image_base64}}
-            ]
-        }
+        {"role": "system", "content": "你是专业的宠物专家，精通动物品种和动物医疗方面知识，回答要简洁精准。如果用户提问涉及品种识别，请先识别品种，再回答问题；如果用户判断错误，要指出并解释。"}
     ]
+    
+    # 根据use_history决定是否添加历史对话
+    if use_history:
+        for msg in chat_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_input},
+            {"type": "image_url", "image_url": {"url": image_base64}}
+        ]
+    })
+    
     try:
-        response = client.chat.completions.create(model="glm-4v", messages=messages, temperature=0.3)
+        response = client.chat.completions.create(
+            model="glm-4v",
+            messages=messages,
+            temperature=0.3
+        )
         return response.choices[0].message.content
     except Exception as e:
         st.error(f"❌ 多模态请求出错：{str(e)}")
         return "抱歉，暂时无法处理图片请求，请稍后再试。"
 
-def pet_text_chat(user_input, chat_history):
-    context = "\n".join([f"{item['role']}: {item['content']}" for item in chat_history])
-    prompt = f"""
-        你是专业的宠物养护助手，结合历史对话回答用户问题，要个性化：
-        历史对话：{context}
-        用户问题：{user_input}
-    """
+def pet_text_chat(user_input, chat_history, use_history=True):
+    messages = [
+        {"role": "system", "content": "你是专业的宠物养护助手，结合历史对话回答用户问题，回答要个性化、简洁实用。"}
+    ]
+    
+    # 根据use_history决定是否添加历史对话
+    if use_history:
+        for msg in chat_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    
+    messages.append({"role": "user", "content": user_input})
+    
     try:
-        response = client.chat.completions.create(model="glm-4", messages=[{"role": "user", "content": prompt}], temperature=0.3)
+        response = client.chat.completions.create(
+            model="glm-4",
+            messages=messages,
+            temperature=0.3
+        )
         return response.choices[0].message.content
     except Exception as e:
         st.error(f"❌ 文本请求出错：{str(e)}")
         return "抱歉，暂时无法处理请求，请稍后再试。"
 
 # ------------------------------
-# 界面布局（修复图片上传bug）
+# 6. 界面布局（核心：自动切换逻辑）
 # ------------------------------
 st.title("🐾 宠物识别与养护助手 ")
 
-
-# 侧边栏功能区
+# 侧边栏
 with st.sidebar:
     # 百度语音状态
     if baidu_client:
@@ -279,54 +286,49 @@ with st.sidebar:
     else:
         st.error("❌ 未配置百度语音参数")
     
-    # 图片上传（核心修复：添加key + 强制更新状态）
+    # 图片上传
     st.subheader("📷 上传宠物照片")
     uploaded_image = st.file_uploader(
         "选择照片（jpg/png）", 
         type=["jpg", "png", "jpeg"],
-        key="pet_image_uploader",  # 关键：添加唯一key，确保组件状态跟踪
-        help="上传新图片会自动替换旧图片，无需清空对话"
+        key="pet_image_uploader",
+        help="上传新照片会自动触发「只看当前照片，不参考历史」模式"
     )
     
-    # 修复：检测新图片上传并强制更新session_state
+    # 检测新图片上传（核心：设置新图片标志）
     if uploaded_image:
-        # 生成唯一标识（文件名+大小），判断是否是新图片
         image_identifier = f"{uploaded_image.name}_{uploaded_image.size}"
         if image_identifier != st.session_state.last_image_uploaded:
             image_base64 = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
             st.session_state.uploaded_image_base64 = f"data:image/jpeg;base64,{image_base64}"
-            st.session_state.last_image_uploaded = image_identifier  # 更新最后上传的标识
-            st.success("✅ 新图片已上传并生效！")
+            st.session_state.last_image_uploaded = image_identifier
+            # 关键：标记为刚上传新图片
+            st.session_state.is_new_image_uploaded = True
+            st.success("✅ 新图片已上传！AI将仅参考当前照片回答，不使用历史对话")
         st.image(uploaded_image, caption="当前上传的宠物照片", use_column_width=True)
     else:
-        # 无图片时重置状态
         st.session_state.uploaded_image_base64 = None
         st.session_state.last_image_uploaded = None
         st.info("请上传宠物照片以启用图片识别功能")
     
-   
-    
     st.divider()
     
-    # 本地录音模块
+    # 语音设置
     st.subheader("🎤 本地语音提问")
     record_duration = st.number_input("录音时长（秒）", min_value=1, max_value=10, value=5, step=1, key="record_duration")
     
-    # 语音播报发音人选择
     st.subheader("🔊 语音播报设置")
     voice_type = st.selectbox(
         "选择发音人",
         options=["女声（默认）", "男声", "情感女声", "情感男声"],
         index=0,
-        key="voice_type",
-        help="不同发音人效果不同，可按需选择"
+        key="voice_type"
     )
     per_map = {"女声（默认）":0, "男声":1, "情感女声":3, "情感男声":4}
     selected_per = per_map[voice_type]
     
-    # 开始录音按钮
+    # 录音按钮
     if st.button("▶️ 开始录音并识别", type="primary", key="record_btn"):
-        # 录音 → 识别 → 对话 → 合成语音
         wav_bytes = record_audio_with_sounddevice(duration=record_duration)
         if not wav_bytes:
             st.stop()
@@ -338,33 +340,53 @@ with st.sidebar:
         st.success(f"✅ 语音识别结果：{recognized_text}")
         user_prompt = recognized_text
         
-        # 展示用户输入（修复：去掉key参数）
+        # 添加用户语音输入到对话历史
         with st.chat_message("user"):
-            st.markdown(user_prompt)
+            st.markdown(f"🎤 语音输入：{user_prompt}")
         st.session_state.chat_history.append({"role": "user", "content": user_prompt})
         
-        # 调用智谱AI生成回复（使用最新的图片）
+        # 自动判断模式
+        intent = detect_intent(user_prompt)
+        # 刚上传新图片 → 只看图片，不看历史
+        if st.session_state.is_new_image_uploaded:
+            use_image = True
+            use_history = False
+            # 重置新图片标志
+            st.session_state.is_new_image_uploaded = False
+        elif intent == "history":
+            # 回溯历史 → 只看历史，不看图片
+            use_image = False
+            use_history = True
+        elif intent == "current_image":
+            # 当前图片提问 → 看图片+历史
+            use_image = True
+            use_history = True
+        else:
+            # 默认模式
+            use_image = True if st.session_state.uploaded_image_base64 else False
+            use_history = True
+        
+        # 生成AI回复
         with st.chat_message("assistant"):
             with st.spinner("🤔 正在生成回复..."):
-                if st.session_state.uploaded_image_base64:
-                    response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history)
+                if use_image and st.session_state.uploaded_image_base64:
+                    response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history, use_history)
                 else:
-                    response = pet_text_chat(user_prompt, st.session_state.chat_history)
+                    response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history)
             st.markdown(response)
             
-            # 生成语音（修复后）
+            # 语音合成
             tts_audio_segments = baidu_text_to_speech(response, per=selected_per)
             if tts_audio_segments:
                 st.session_state.tts_audio_segments = tts_audio_segments
-                # 生成前端合并播放的按钮
-                merge_js = merge_audio_frontend(tts_audio_segments)
+                merge_js = merge_audio_frontend(st.session_state.tts_audio_segments)
                 if merge_js:
                     st.components.v1.html(merge_js, height=50)
-                # 保留分段播放按钮
-                for idx, audio_bytes in enumerate(tts_audio_segments):
+                for idx, audio_bytes in enumerate(st.session_state.tts_audio_segments):
                     st.caption(f"🎧 语音播报 - 第{idx+1}段")
                     st.audio(audio_bytes, format='audio/mp3', start_time=0)
         
+        # 添加AI回复到对话历史
         st.session_state.chat_history.append({"role": "assistant", "content": response})
     
     st.divider()
@@ -378,55 +400,72 @@ with st.sidebar:
     if st.button("🗑️ 清空对话历史", key="clear_chat"):
         st.session_state.chat_history = []
         st.session_state.tts_audio_segments = []
-        # 保留图片状态（可选：如需清空图片，取消下面注释）
-        # st.session_state.uploaded_image_base64 = None
-        # st.session_state.last_image_uploaded = None
         st.rerun()
 
 # ------------------------------
-# 聊天界面（修复：去掉所有st.chat_message的key参数）
+# 聊天界面
 # ------------------------------
-# 渲染历史对话
-for idx, msg in enumerate(st.session_state.chat_history):
+for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        # 助手回复展示语音播放按钮
+        # 修复：使用全局状态的tts_audio_segments，而非局部变量
         if msg["role"] == "assistant" and st.session_state.tts_audio_segments:
-            # 生成前端合并播放的按钮
             merge_js = merge_audio_frontend(st.session_state.tts_audio_segments)
             if merge_js:
                 st.components.v1.html(merge_js, height=50)
-            # 保留分段播放按钮
             for seg_idx, audio_bytes in enumerate(st.session_state.tts_audio_segments):
                 st.caption(f"🎧 语音播报 - 第{seg_idx+1}段")
                 st.audio(audio_bytes, format='audio/mp3')
 
-# 文字输入框（添加key）
+# 文字输入框
 user_prompt = st.chat_input("输入你的问题（如：它一直挠耳朵怎么办？）", key="chat_input")
 if user_prompt:
+    # 添加文字输入到对话历史
     with st.chat_message("user"):
         st.markdown(user_prompt)
     st.session_state.chat_history.append({"role": "user", "content": user_prompt})
     
+    # 自动判断模式
+    intent = detect_intent(user_prompt)
+    # 刚上传新图片 → 只看图片，不看历史
+    if st.session_state.is_new_image_uploaded:
+        use_image = True
+        use_history = False
+        # 重置新图片标志
+        st.session_state.is_new_image_uploaded = False
+    elif intent == "history":
+        # 回溯历史 → 只看历史，不看图片
+        use_image = False
+        use_history = True
+    elif intent == "current_image":
+        # 当前图片提问 → 看图片+历史
+        use_image = True
+        use_history = True
+    else:
+        # 默认模式
+        use_image = True if st.session_state.uploaded_image_base64 else False
+        use_history = True
+    
+    # 生成AI回复
     with st.chat_message("assistant"):
         with st.spinner("正在思考回复..."):
-            if st.session_state.uploaded_image_base64:
-                response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history)
+            if use_image and st.session_state.uploaded_image_base64:
+                response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history, use_history)
             else:
-                response = pet_text_chat(user_prompt, st.session_state.chat_history)
+                response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history)
         st.markdown(response)
         
-        # 生成语音（修复后）
-        tts_audio_segments = baidu_text_to_speech(response, per=selected_per if 'selected_per' in locals() else 0)
+        # 语音合成
+        selected_per = per_map.get(st.session_state.get("voice_type", "女声（默认）"), 0)
+        tts_audio_segments = baidu_text_to_speech(response, per=selected_per)
         if tts_audio_segments:
             st.session_state.tts_audio_segments = tts_audio_segments
-            # 生成前端合并播放的按钮
-            merge_js = merge_audio_frontend(tts_audio_segments)
+            merge_js = merge_audio_frontend(st.session_state.tts_audio_segments)
             if merge_js:
                 st.components.v1.html(merge_js, height=50)
-            # 保留分段播放按钮
-            for idx, audio_bytes in enumerate(tts_audio_segments):
+            for idx, audio_bytes in enumerate(st.session_state.tts_audio_segments):
                 st.caption(f"🎧 语音播报 - 第{idx+1}段")
                 st.audio(audio_bytes, format='audio/mp3', start_time=0)
     
+    # 添加AI回复到对话历史
     st.session_state.chat_history.append({"role": "assistant", "content": response})

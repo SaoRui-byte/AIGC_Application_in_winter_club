@@ -1,7 +1,7 @@
 from zhipuai import ZhipuAI
 import time
 
-client = ZhipuAI(api_key="保密")
+client = ZhipuAI(api_key="")
 
 def stream_output(stream_data):
     for i in stream_data:
@@ -17,7 +17,7 @@ def chat(messages_history):
 
 # 初始化对话历史
 conversation_history = [
-    {"role": "system", "content": "你是钢铁侠里的Javis,我是你的boss"}
+    {"role": "system", "content": "你是健康饮食专家"}
 ]
 
 stream_output("请输入你的专属AI名称：")

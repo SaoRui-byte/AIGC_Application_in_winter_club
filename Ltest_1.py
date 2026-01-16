@@ -1,6 +1,6 @@
 from zhipuai import ZhipuAI
 import time
-client = ZhipuAI(api_key="保密")
+client = ZhipuAI(api_key="")
 
 
 def stream_ouput(stream_data):
@@ -12,7 +12,7 @@ def chat(message):
     response = client.chat.completions.create(
         model="glm-4",
         messages=[
-            {"role": "system", "content": f"你是钢铁侠里的Javis,我是你的boss"},
+            {"role": "system", "content": f"你是健康饮食专家"},
             {"role": "user", "content": message},
         ],
     )

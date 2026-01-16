@@ -39,8 +39,9 @@ if "is_new_image_uploaded" not in st.session_state:
 # ------------------------------
 def detect_intent(user_input):
     """检测用户输入的意图，判断是回溯历史还是当前图片提问"""
-    # 回溯历史的关键词
-    history_keywords = ["之前", "刚才", "之前问的", "那只", "之前的", "之前说的", "之前的问题"]
+    # 回溯历史的关键词（新增"上一个问题"等精准关键词）
+    history_keywords = ["之前", "刚才", "之前问的", "那只", "之前的", "之前说的", 
+                       "之前的问题", "上一个问题", "上一个", "刚才问的"]
     # 当前图片的关键词
     current_image_keywords = ["这只", "这是什么", "它", "这张", "当前", "现在"]
     
@@ -250,14 +251,21 @@ def pet_multimodal_chat(image_base64, user_input, chat_history, use_history=True
         st.error(f"❌ 多模态请求出错：{str(e)}")
         return "抱歉，暂时无法处理图片请求，请稍后再试。"
 
-def pet_text_chat(user_input, chat_history, use_history=True):
+# 【核心修改】新增exclude_last_user参数，排除当前提问，只传更早的历史
+def pet_text_chat(user_input, chat_history, use_history=True, exclude_last_user=False):
     messages = [
-        {"role": "system", "content": "你是专业的宠物养护助手，结合历史对话回答用户问题，回答要个性化、简洁实用。"}
+        {"role": "system", "content": "你是专业的宠物养护助手，结合历史对话回答用户问题，回答要个性化、简洁实用。如果用户问上一个问题/之前的问题是什么，请准确引用历史对话内容回答。"}
     ]
     
     # 根据use_history决定是否添加历史对话
     if use_history:
-        for msg in chat_history:
+        # 排除最后一轮用户提问（当前的回溯提问），只传更早的历史
+        if exclude_last_user and len(chat_history) >= 2:
+            history_to_use = chat_history[:-1]  # 去掉最后一条（当前用户提问）
+        else:
+            history_to_use = chat_history
+        
+        for msg in history_to_use:
             messages.append({"role": msg["role"], "content": msg["content"]})
     
     messages.append({"role": "user", "content": user_input})
@@ -372,7 +380,9 @@ with st.sidebar:
                 if use_image and st.session_state.uploaded_image_base64:
                     response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history, use_history)
                 else:
-                    response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history)
+                    # 【核心修改】回溯历史时，排除当前提问
+                    exclude_last = True if intent == "history" else False
+                    response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history, exclude_last)
             st.markdown(response)
             
             # 语音合成
@@ -452,7 +462,9 @@ if user_prompt:
             if use_image and st.session_state.uploaded_image_base64:
                 response = pet_multimodal_chat(st.session_state.uploaded_image_base64, user_prompt, st.session_state.chat_history, use_history)
             else:
-                response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history)
+                # 【核心修改】回溯历史时，传入exclude_last_user=True，排除当前提问
+                exclude_last = True if intent == "history" else False
+                response = pet_text_chat(user_prompt, st.session_state.chat_history, use_history, exclude_last)
         st.markdown(response)
         
         # 语音合成
